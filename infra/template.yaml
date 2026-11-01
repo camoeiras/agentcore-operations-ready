@@ -1,0 +1,181 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  AgentCore Operations Demo: repositório ECR, papel de execução e AgentCore Runtime HTTP.
+  O Runtime só é criado quando ImageTag aponta para uma imagem já publicada no repositório.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Modelo }
+        Parameters: [ModelProvider, ModelId]
+      - Label: { default: Runtime }
+        Parameters: [RuntimeName, ImageTag, IdleSessionTimeout, MaxSessionLifetime]
+      - Label: { default: Imagem }
+        Parameters: [RepositoryName]
+
+Parameters:
+  ModelProvider:
+    Type: String
+    Default: ollama
+    AllowedValues: [ollama, bedrock]
+    Description: >-
+      ollama usa o modelo embutido na imagem (qwen3:1.7b em CPU); bedrock usa ModelId.
+      Trocar não exige nova imagem.
+  RuntimeName:
+    Type: String
+    Default: operations_agent_demo
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9_]{0,47}$"
+    Description: Nome do Runtime (não pode ser alterado depois da criação).
+  RepositoryName:
+    Type: String
+    Default: agentcore-operations-demo
+  ImageTag:
+    Type: String
+    Default: ""
+    Description: Tag da imagem ARM64 no ECR. Vazio cria apenas ECR e IAM.
+  ModelId:
+    Type: String
+    Default: minimax.minimax-m2.5
+    Description: Modelo Bedrock, usado quando ModelProvider=bedrock (ex. us.amazon.nova-lite-v1:0).
+  IdleSessionTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 60
+  MaxSessionLifetime:
+    Type: Number
+    Default: 1800
+    MinValue: 60
+
+Conditions:
+  HasImage: !Not [!Equals [!Ref ImageTag, ""]]
+  UseBedrock: !Equals [!Ref ModelProvider, bedrock]
+
+Resources:
+  Repository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref RepositoryName
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules": [{"rulePriority": 1, "description": "Mantém as 10 imagens mais recentes",
+            "selection": {"tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 10},
+            "action": {"type": "expire"}}]}
+      Tags:
+        - { Key: Project, Value: agentcore-operations-demo }
+        - { Key: Environment, Value: demo }
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: AgentCore Operations Demo execution role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: bedrock-agentcore.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+              ArnLike: { aws:SourceArn: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*" }
+      Policies:
+        - PolicyName: AgentCoreOperationsDemo
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ECRPull
+                Effect: Allow
+                Action: [ecr:BatchGetImage, ecr:GetDownloadUrlForLayer]
+                Resource: !GetAtt Repository.Arn
+              - Sid: ECRToken
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: BedrockModel
+                Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                # Perfis cross-region roteiam para modelos em outras regiões.
+                Resource:
+                  - arn:aws:bedrock:*::foundation-model/*
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+              - Sid: RuntimeLogs
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:DescribeLogStreams, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
+              - Sid: DescribeLogGroups
+                Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: "*"
+              - Sid: RuntimeLogsResourcePolicy
+                Effect: Allow
+                Action: logs:PutResourcePolicy
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/${RuntimeName}-*"
+              - Sid: RuntimeTraces
+                Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords, xray:GetSamplingRules, xray:GetSamplingTargets]
+                Resource: "*"
+              - Sid: RuntimeMetrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals: { cloudwatch:namespace: bedrock-agentcore }
+              - Sid: WorkloadIdentity
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetWorkloadAccessToken
+                  - bedrock-agentcore:GetWorkloadAccessTokenForJWT
+                  - bedrock-agentcore:GetWorkloadAccessTokenForUserId
+                Resource:
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default"
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/${RuntimeName}-*"
+      Tags:
+        - { Key: Project, Value: agentcore-operations-demo }
+        - { Key: Environment, Value: demo }
+
+  Runtime:
+    Type: AWS::BedrockAgentCore::Runtime
+    Condition: HasImage
+    Properties:
+      AgentRuntimeName: !Ref RuntimeName
+      Description: Operations Agent fictício para palestra; ferramentas simuladas
+      RoleArn: !GetAtt ExecutionRole.Arn
+      AgentRuntimeArtifact:
+        ContainerConfiguration:
+          ContainerUri: !Sub "${Repository.RepositoryUri}:${ImageTag}"
+      NetworkConfiguration:
+        NetworkMode: PUBLIC
+      ProtocolConfiguration: HTTP
+      # As variáveis do Ollama embutido (modelo, host local) vêm do Dockerfile.
+      EnvironmentVariables:
+        MODEL_PROVIDER: !Ref ModelProvider
+        BEDROCK_MODEL_ID: !Ref ModelId
+        AWS_REGION: !Ref AWS::Region
+      LifecycleConfiguration:
+        IdleRuntimeSessionTimeout: !Ref IdleSessionTimeout
+        MaxLifetime: !Ref MaxSessionLifetime
+      Tags:
+        Project: agentcore-operations-demo
+        Environment: demo
+
+Outputs:
+  RepositoryUri:
+    Value: !GetAtt Repository.RepositoryUri
+  ExecutionRoleArn:
+    Value: !GetAtt ExecutionRole.Arn
+  RuntimeArn:
+    Condition: HasImage
+    Value: !GetAtt Runtime.AgentRuntimeArn
+  RuntimeId:
+    Condition: HasImage
+    Value: !GetAtt Runtime.AgentRuntimeId
+  ModelInUse:
+    Value: !If [UseBedrock, !Sub "bedrock: ${ModelId}", "ollama embutido: qwen3:1.7b"]
+  RuntimeLogs:
+    Condition: HasImage
+    Description: Prefixo do log group do contêiner (stdout/stderr) no CloudWatch
+    Value: !Sub "/aws/bedrock-agentcore/runtimes/${Runtime.AgentRuntimeId}"
+  TestCommand:
+    Value: !Sub ".\\scripts\\invoke.ps1 -Region ${AWS::Region} -StackName ${AWS::StackName}"
