@@ -1,0 +1,13 @@
+services:
+  agent:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      MODEL_PROVIDER: ollama
+      # Usa o Ollama do host (modelos maiores); a imagem traz um embutido para o AgentCore.
+      OLLAMA_EMBEDDED: "0"
+      OLLAMA_HOST: http://host.docker.internal:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gpt-oss:20b}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
